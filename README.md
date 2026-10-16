@@ -26,3 +26,7 @@ logs in to Google Drive, and starts the bot as a background service.
 ## Notes
 - Telegram bots can download files up to 20 MB each (cloud Bot API).
 - Never commit `.env`, `token.json` or `credentials.json`.
+
+## Files larger than 20 MB (up to 2 GB)
+After `setup.sh`, run `bash bigfiles.sh`. It starts Telegram's local Bot API server in Docker
+(needs api_id/api_hash from https://my.telegram.org) and switches the bot to it.
