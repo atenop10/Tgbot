@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 import zipfile
 from urllib.parse import urljoin
 from pathlib import Path
@@ -59,6 +60,40 @@ STATE = {"gen": 0}  # /stop increases this; running ffmpeg / uploads / zipping n
 
 class Stopped(Exception):
     pass
+
+
+# ---------- Retry ----------
+RETRIES = int(os.getenv("RETRIES", "2"))  # extra attempts after the first one (2 = 3 tries in total)
+RETRY_DELAY = float(os.getenv("RETRY_DELAY", "3"))  # seconds; grows with each attempt (3s, 6s, ...)
+
+
+def retry_sync(func, *args, cancelled=lambda: False, label="", **kwargs):
+    """Call func(*args). On failure retry up to RETRIES more times. /stop is never retried."""
+    for attempt in range(RETRIES + 1):
+        try:
+            return func(*args, **kwargs)
+        except Stopped:
+            raise
+        except Exception as e:
+            if attempt >= RETRIES or cancelled():
+                raise
+            log.warning("%s failed (attempt %d/%d): %s - retrying", label or func.__name__, attempt + 1, RETRIES + 1, e)
+            reset_drive_service()  # a stale connection is a common cause: rebuild it
+            time.sleep(RETRY_DELAY * (attempt + 1))
+
+
+async def retry_async(coro_fn, *args, label="", **kwargs):
+    """Same as retry_sync for coroutines."""
+    for attempt in range(RETRIES + 1):
+        try:
+            return await coro_fn(*args, **kwargs)
+        except (Stopped, asyncio.CancelledError):
+            raise
+        except Exception as e:
+            if attempt >= RETRIES:
+                raise
+            log.warning("%s failed (attempt %d/%d): %s - retrying", label or "task", attempt + 1, RETRIES + 1, e)
+            await asyncio.sleep(RETRY_DELAY * (attempt + 1))
 
 
 def make_check():
@@ -130,6 +165,12 @@ def drive_service(fresh: bool = False):
         if _service is None:
             _service = build("drive", "v3", credentials=creds, cache_discovery=False)
         return _service
+
+
+def reset_drive_service():
+    global _service
+    with _drive_lock:
+        _service = None
 
 
 def get_or_create_folder(path: str) -> str:
@@ -321,7 +362,11 @@ def upload_to_site(path: Path, story_id, cancelled=lambda: False) -> str:
 
 
 def do_upload(path: Path, uid: int, cancelled=lambda: False) -> str:
-    """Send one file to the chosen destination (Google Drive or the website)."""
+    """Send one file to the chosen destination, retrying failed attempts."""
+    return retry_sync(_do_upload_once, path, uid, cancelled, cancelled=cancelled, label=f"upload {path.name}")
+
+
+def _do_upload_once(path: Path, uid: int, cancelled=lambda: False) -> str:
     st = get_user_settings(uid)
     if st.get("dest") == "site":
         if not st.get("story_id"):
@@ -573,7 +618,7 @@ async def _process_file(msg, bot, uid: int, ctx: dict):
 
     dest = unique_path(user_dir(uid), name)
     ctx["dest"] = dest
-    try:
+    async def _download():
         await busy()
         tg_file = await bot.get_file(
             tg_file_id, read_timeout=3600, write_timeout=3600, connect_timeout=60
@@ -583,11 +628,14 @@ async def _process_file(msg, bot, uid: int, ctx: dict):
             await asyncio.to_thread(shutil.move, str(local), str(dest))
         else:
             await tg_file.download_to_drive(custom_path=dest)
+
+    try:
+        await retry_async(_download, label=f"download {name}")
     except Exception as e:
         log.exception("download failed")
         dest.unlink(missing_ok=True)
         note = "" if LOCAL_API_URL else "\n(Telegram's default bot limit is 20 MB. Run bigfiles.sh to allow up to 2 GB.)"
-        await say(msg, f"Could not download '{name}': {e}{note}")
+        await say(msg, f"Could not download '{name}' after {RETRIES + 1} attempts: {e}{note}")
         return
 
     info = ""
@@ -622,7 +670,7 @@ async def _process_file(msg, bot, uid: int, ctx: dict):
             log.exception("auto upload failed")
             queue_order.setdefault(uid, []).append(dest)
             ctx["committed"] = True
-            await say(msg, f"Upload failed: {e}\nFile kept in queue; try /upload.")
+            await say(msg, f"Upload failed after {RETRIES + 1} attempts: {e}\nFile kept in queue; try /upload.")
         return
 
     queue_order.setdefault(uid, []).append(dest)
@@ -849,7 +897,7 @@ async def _upload_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
             raise asyncio.CancelledError()
         except Exception as e:
             log.exception("upload failed for %s", f.name)
-            failed.append(f"{f.name}: {e}")
+            failed.append(f"{f.name} (after {RETRIES + 1} attempts): {e}")
         if status and i < len(files):
             try:
                 await status.edit_text(f"Uploading... {i}/{len(files)}  ({f.name})")
@@ -911,7 +959,10 @@ async def _zip_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.to_thread(make_zip, files, zip_path, cancelled)
         if status:
             await status.edit_text(f"Zipped ({human_size(zip_path.stat().st_size)}). Uploading to Drive...")
-        link = await asyncio.to_thread(upload_to_drive, zip_path, target_folder_id(uid), cancelled)
+        link = await asyncio.to_thread(
+            retry_sync, upload_to_drive, zip_path, target_folder_id(uid), cancelled,
+            cancelled=cancelled, label=f"upload {zip_path.name}",
+        )
         text = f"Uploaded: {name} to {target_folder_name(uid)}\n{link}"
         if status:
             await status.edit_text(text)
