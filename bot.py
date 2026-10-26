@@ -10,6 +10,7 @@ import subprocess
 import threading
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin
 from pathlib import Path
 
@@ -39,6 +40,11 @@ WORK_DIR = Path(os.getenv("WORK_DIR", "work"))
 SITE_URL = os.getenv("SITE_URL") or None  # e.g. https://yoursite.com/r2admin.php
 SITE_PIN = os.getenv("SITE_PIN") or None  # admin PIN (keep it only in .env)
 TOKEN_FILE = "token.json"
+# --- speed tuning (all optional, set in .env) ---
+PARALLEL_FILES = max(1, int(os.getenv("PARALLEL_FILES", str(max(2, min(4, os.cpu_count() or 2))))))  # files downloaded/compressed at the same time
+SITE_PARALLEL = max(1, int(os.getenv("SITE_PARALLEL", "6")))  # parts of a website upload sent at the same time
+PART_RETRIES = max(0, int(os.getenv("PART_RETRIES", "3")))  # retries of ONE failed part (not the whole file)
+MP3_LEVEL = min(9, max(0, int(os.getenv("MP3_LEVEL", "7"))))  # ffmpeg mp3 effort: 0 best/slowest ... 9 fastest
 SETTINGS_FILE = Path("settings.json")
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
@@ -251,7 +257,8 @@ def site_login() -> str:
         csrf = _csrf_from(lp) or _csrf_from(page)
         if not csrf:
             raise RuntimeError("Could not find the login token on the site page")
-        sess.post(login_url, data={"csrf": csrf, "login_pin": SITE_PIN}, timeout=30)
+        # send every field name the site has used: new admin.php wants action=login + pin, older one wanted login_pin
+        sess.post(login_url, data={"csrf": csrf, "action": "login", "pin": SITE_PIN, "login_pin": SITE_PIN}, timeout=30)
         page = sess.get(SITE_URL, timeout=30).text
         if _is_login(page):
             # the page may still show a form: ask the upload API whether we are logged in
@@ -281,7 +288,8 @@ def site_page() -> str:
 def site_stories() -> list:
     with _site_lock:
         page = site_page()
-    found = re.findall(r'story-title">(.*?)</div>\s*<div class="small">\s*ID (\d+)', page, flags=re.S)
+    # accepts both 'ID 6' (r2admin.php) and 'Story ID: 6' (admin.php dashboard)
+    found = re.findall(r'story-title[^>]*>(.*?)</div>\s*<div class="small"[^>]*>\s*(?:Story\s+)?ID:?\s*(\d+)', page, flags=re.S)
     return [{"id": int(i), "title": htmllib.unescape(t).strip()} for t, i in found]
 
 
@@ -301,6 +309,11 @@ def site_add_story(title: str) -> dict:
 
 
 def site_api(payload: dict) -> dict:
+    with _site_lock:  # short calls only; the big R2 transfers run outside this lock
+        return _site_api_locked(payload)
+
+
+def _site_api_locked(payload: dict) -> dict:
     url = urljoin(SITE_URL, "r2_upload_api.php")
     err = "unknown error"
     for attempt in (1, 2):
@@ -321,43 +334,76 @@ def site_api(payload: dict) -> dict:
     raise RuntimeError(f"Website: {err}")
 
 
+_part_pool = ThreadPoolExecutor(max_workers=SITE_PARALLEL, thread_name_prefix="r2part")
+_tls = threading.local()
+
+
+def _put_session() -> requests.Session:
+    """One keep-alive HTTP session per worker thread (faster than a new connection per part)."""
+    sess = getattr(_tls, "sess", None)
+    if sess is None:
+        sess = _tls.sess = requests.Session()
+    return sess
+
+
+def _upload_part(path: Path, upload_id: str, n: int, part_size: int, mime: str, cancelled) -> dict:
+    """Read part n from the file and PUT it to R2. A failed part is retried on its own."""
+    last = None
+    for attempt in range(PART_RETRIES + 1):
+        if cancelled():
+            raise Stopped()
+        try:
+            signed = site_api({"action": "sign_part", "uploadId": upload_id, "partNumber": n})
+            with open(path, "rb") as f:
+                f.seek((n - 1) * part_size)
+                chunk = f.read(part_size)
+            r = _put_session().put(signed["url"], data=chunk, headers={"Content-Type": mime}, timeout=(20, 1800))
+            if not r.ok:
+                raise RuntimeError(f"R2 upload failed with HTTP {r.status_code}")
+            etag = r.headers.get("ETag")
+            if not etag:
+                raise RuntimeError("R2 did not return an ETag (bucket CORS ExposeHeaders?)")
+            return {"partNumber": n, "etag": etag}
+        except Stopped:
+            raise
+        except Exception as e:
+            last = e
+            if attempt < PART_RETRIES:
+                log.warning("part %d of %s failed (%s) - retrying", n, path.name, e)
+                time.sleep(1 + 2 * attempt)
+    raise last
+
+
 def upload_to_site(path: Path, story_id, cancelled=lambda: False) -> str:
-    """Upload through the site's own API (initiate -> sign_part -> PUT to R2 -> complete) so it is registered."""
+    """Upload through the site's own API (initiate -> sign_part -> PUT to R2 -> complete), parts in parallel."""
     if path.suffix.lower() not in SITE_AUDIO_EXTS:
         raise RuntimeError("the website only accepts audio: " + ", ".join(sorted(e[1:] for e in SITE_AUDIO_EXTS)))
     size = path.stat().st_size
     mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    with _site_lock:  # one upload at a time
-        if cancelled():
-            raise Stopped()
-        started = site_api({
-            "action": "initiate", "storyId": str(story_id),
-            "fileName": path.name, "fileSize": size, "mimeType": mime,
-        })
-        upload_id = started["uploadId"]
-        part_size, total = int(started["partSize"]), int(started["totalParts"])
-        parts = []
+    if cancelled():
+        raise Stopped()
+    started = site_api({
+        "action": "initiate", "storyId": str(story_id),
+        "fileName": path.name, "fileSize": size, "mimeType": mime,
+    })
+    upload_id = started["uploadId"]
+    part_size, total = int(started["partSize"]), int(started["totalParts"])
+    futures = []
+    try:
+        futures = [
+            _part_pool.submit(_upload_part, path, upload_id, n, part_size, mime, cancelled)
+            for n in range(1, total + 1)
+        ]
+        parts = [fu.result() for fu in futures]  # in part order
+        site_api({"action": "complete", "uploadId": upload_id, "parts": parts})
+    except BaseException:
+        for fu in futures:
+            fu.cancel()
         try:
-            with open(path, "rb") as f:
-                for n in range(1, total + 1):
-                    if cancelled():
-                        raise Stopped()
-                    signed = site_api({"action": "sign_part", "uploadId": upload_id, "partNumber": n})
-                    chunk = f.read(part_size)
-                    r = requests.put(signed["url"], data=chunk, headers={"Content-Type": mime}, timeout=(20, 1800))
-                    if not r.ok:
-                        raise RuntimeError(f"R2 upload failed with HTTP {r.status_code}")
-                    etag = r.headers.get("ETag")
-                    if not etag:
-                        raise RuntimeError("R2 did not return an ETag (bucket CORS ExposeHeaders?)")
-                    parts.append({"partNumber": n, "etag": etag})
-            site_api({"action": "complete", "uploadId": upload_id, "parts": parts})
-        except BaseException:
-            try:
-                site_api({"action": "abort", "uploadId": upload_id})  # don't leave half uploads in R2
-            except Exception:
-                pass
-            raise
+            site_api({"action": "abort", "uploadId": upload_id})  # don't leave half uploads in R2
+        except Exception:
+            pass
+        raise
     return "saved on the website"
 
 
@@ -513,7 +559,7 @@ def compress_audio(src: Path, bitrate: int, mono: bool, cancelled=lambda: False)
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error", "-i", str(src),
         "-vn", "-map_metadata", "0", "-codec:a", "libmp3lame",
-        "-compression_level", "7",  # faster encoding
+        "-compression_level", str(MP3_LEVEL),  # higher = faster encoding
         "-b:a", f"{bitrate}k",
     ]
     if mono:
@@ -556,21 +602,46 @@ def get_queue(uid: int) -> asyncio.Queue:
     return q
 
 
+file_tasks: dict[int, set] = {}  # files being processed right now, per user
+
+
 async def worker(uid: int, q: asyncio.Queue):
-    while True:
-        msg, bot = await q.get()
-        current_job[uid] = True
+    """Download + compress up to PARALLEL_FILES files at once. Numbering, queueing and
+    uploading still happen in the order the files were sent (see the gate in _process_file)."""
+    sem = asyncio.Semaphore(PARALLEL_FILES)
+    active = file_tasks.setdefault(uid, set())
+    prev_gate = None
+
+    async def run_one(msg, bot, gate_prev, gate_self):
         try:
-            await process_file(msg, bot, uid)
+            await process_file(msg, bot, uid, gate_prev)
         except Stopped:
             pass
-        except Exception:
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
             log.exception("processing failed")
+            try:  # tell the user instead of failing silently
+                await say(msg, f"Could not process this file: {e}")
+            except Exception:
+                pass
         finally:
+            gate_self.set()  # let the next file continue, whatever happened here
+            active.discard(asyncio.current_task())
             if queues.get(uid) is q:  # not replaced by /stop
                 pending[uid] = max(0, pending.get(uid, 1) - 1)
-                current_job[uid] = False
+                current_job[uid] = bool(active)
             q.task_done()
+            sem.release()
+
+    while True:
+        await sem.acquire()
+        msg, bot = await q.get()
+        current_job[uid] = True
+        gate = asyncio.Event()
+        task = asyncio.create_task(run_one(msg, bot, prev_gate, gate))
+        active.add(task)
+        prev_gate = gate
 
 
 async def wait_idle(uid: int, msg=None):
@@ -581,10 +652,10 @@ async def wait_idle(uid: int, msg=None):
     await get_queue(uid).join()
 
 
-async def process_file(msg, bot, uid: int):
+async def process_file(msg, bot, uid: int, gate_prev=None):
     ctx = {"dest": None, "committed": False}
     try:
-        await _process_file(msg, bot, uid, ctx)
+        await _process_file(msg, bot, uid, ctx, gate_prev)
     except asyncio.CancelledError:
         d = ctx["dest"]
         if d is not None and not ctx["committed"]:
@@ -592,7 +663,7 @@ async def process_file(msg, bot, uid: int):
         raise
 
 
-async def _process_file(msg, bot, uid: int, ctx: dict):
+async def _process_file(msg, bot, uid: int, ctx: dict, gate_prev=None):
     cancelled = make_check()
     if msg.document:
         tg_file_id, name = msg.document.file_id, msg.document.file_name or "document"
@@ -656,6 +727,9 @@ async def _process_file(msg, bot, uid: int, ctx: dict):
             log.exception("compression failed")
             info = f"\nCompression failed, original kept: {e}"
 
+    if gate_prev is not None:
+        await gate_prev.wait()  # the previous file is done: now number / upload in the order sent
+    st = get_user_settings(uid)
     dest = apply_number(uid, dest)
     ctx["dest"] = dest
 
@@ -726,7 +800,7 @@ OTHER
 /start - short welcome
 
 TIPS
-- Files are handled one at a time; a big file delays the ones behind it.
+- Several files are downloaded/compressed at the same time; numbering and upload keep the order you sent them.
 - Send photos as 'File' to keep full quality.
 - Telegram limits bot downloads to 20 MB unless the big-files setup is installed (up to 2 GB).
 - Before a new numbered batch: /number reset"""
@@ -1037,6 +1111,8 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     w = worker_tasks.pop(uid, None)
     if w is not None and not w.done():
         w.cancel()
+    for ft in list(file_tasks.pop(uid, set())):
+        ft.cancel()
     pending[uid] = 0
     current_job[uid] = False
 
