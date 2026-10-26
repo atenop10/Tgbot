@@ -289,22 +289,33 @@ def site_stories() -> list:
     with _site_lock:
         page = site_page()
     # accepts both 'ID 6' (r2admin.php) and 'Story ID: 6' (admin.php dashboard)
-    found = re.findall(r'story-title[^>]*>(.*?)</div>\s*<div class="small"[^>]*>\s*(?:Story\s+)?ID:?\s*(\d+)', page, flags=re.S)
-    return [{"id": int(i), "title": htmllib.unescape(t).strip()} for t, i in found]
+    found = re.findall(r'<div class="story-title"[^>]*>(.*?)</div>\s*<div class="small"[^>]*>\s*(?:Story\s+)?ID:?\s*(\d+)', page, flags=re.S)
+    if not found and not re.search(r'name="action"\s+value="logout"', page):
+        # not the dashboard at all (login page, host protection page, error page...)
+        title = re.search(r'<title>(.*?)</title>', page, flags=re.S | re.I)
+        log.warning("Site page is not the dashboard. Title: %s | start: %r", title.group(1).strip() if title else None, page[:200])
+        _site["session"] = None
+        raise RuntimeError("The site did not return the admin dashboard (login failed or the host blocked the bot). Check SITE_URL / SITE_PIN, then see the bot log.")
+    return [{"id": int(i), "title": htmllib.unescape(re.sub(r'<[^>]+>', '', t)).strip()} for t, i in found]
 
 
 def site_add_story(title: str) -> dict:
     with _site_lock:
         site_page()
-        _site["session"].post(
+        r = _site["session"].post(
             SITE_URL,
             data={"csrf": _site["csrf"], "action": "add_story", "title": title, "description": ""},
             timeout=60,
         )
+        # the site answers with a redirect to a page that shows a green/red notice
+        m = re.search(r'<div class="notice( error)?">\s*(.*?)\s*</div>', r.text, flags=re.S)
+        if m and m.group(1):
+            raise RuntimeError(htmllib.unescape(m.group(2)).strip())
     stories = site_stories()
-    for st in stories:  # newest first on the site
-        if st["title"] == title:
-            return st
+    want = title.strip().casefold()
+    hits = [st for st in stories if st["title"].strip().casefold() == want]
+    if hits:
+        return max(hits, key=lambda x: x["id"])  # newest = highest ID
     raise RuntimeError("Story was not created (the site did not list it afterwards)")
 
 
